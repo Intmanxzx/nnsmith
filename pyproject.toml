@@ -6,3 +6,7 @@ build-backend = "setuptools.build_meta"
 write_to = "nnsmith/_version.py"
 version_scheme = "release-branch-semver"
 local_scheme = "no-local-version"
+
+# AutofuseX consumes this fork as a normal pip dependency. The AscendC
+# integration changes live in the fork's history rather than being applied
+# by the consumer at install time.

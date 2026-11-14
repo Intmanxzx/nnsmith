@@ -24,7 +24,9 @@ __ENABLE_RT_CHECK__ = os.getenv("NNSMITH_RT_CHECK", "0") == "1"
 
 
 # Probabilistically, sampling at positive domain is beneficial.
-def random_tensor(shape, dtype: torch.dtype, margin=4, base=5, use_cuda=False):
+def random_tensor(
+    shape, dtype: torch.dtype, margin=4, base=5, use_cuda=False, mode="uniform", role="input"
+):
     # center: -margin ~ 0 ~ +margin
     dev = torch.device("cuda" if use_cuda else "cpu")
     if base == "center":
@@ -32,7 +34,67 @@ def random_tensor(shape, dtype: torch.dtype, margin=4, base=5, use_cuda=False):
     else:
         assert isinstance(base, int) or isinstance(base, float)
 
-    fp_tensor = base + (torch.rand(shape, device=dev) - 0.5) * margin
+    if mode == "uniform":
+        fp_tensor = base + (torch.rand(shape, device=dev) - 0.5) * margin
+    elif mode == "log_scale":
+        # Covers near-zero, mid-range, and large-magnitude values in one
+        # tensor instead of a single linear band -- sample a magnitude
+        # exponent uniformly in [-margin, margin] and a random sign, rather
+        # than a single uniform band around `base` (which the "uniform"
+        # mode above is designed for and would never produce values near
+        # the fp16/bf16 precision boundary).
+        sign = torch.sign(torch.rand(shape, device=dev) - 0.5)
+        exponent = (torch.rand(shape, device=dev) - 0.5) * 2 * margin
+        fp_tensor = sign * torch.pow(10.0, exponent)
+    elif mode == "llm":
+        if role == "weight":
+            # BERT/GPT-style weight init: N(0, 0.02^2).
+            fp_tensor = torch.randn(shape, device=dev) * 0.02
+        elif role == "input":
+            # Real LLM activations (e.g. LLaMA2-7B) are mostly small,
+            # zero-mean, with a median magnitude around 0.2 -- but a small
+            # fraction of elements are "massive activations" that are
+            # roughly 100x-10000x larger in magnitude. Model that as a
+            # N(0, 0.2^2) base tensor where 5% of the elements (chosen
+            # independently per-element) get an extra independent
+            # [100, 10000) magnitude amplification.
+            base_tensor = torch.randn(shape, device=dev) * 0.2
+            mask = torch.rand(shape, device=dev) < 0.05
+            amplification = 100 + torch.rand(shape, device=dev) * 9900
+            fp_tensor = base_tensor * torch.where(mask, amplification, 1.0)
+        else:
+            raise ValueError(f"Unknown random_tensor role: {role!r}")
+    elif mode == "recommendation":
+        if role == "weight":
+            # Recommendation-style embedding init: N(0, 1/sqrt(numel)).
+            # numel == 1 (e.g. a scalar tensor) yields std == 1, which is
+            # the correct, non-degenerate result of the formula itself --
+            # no special-casing needed.
+            numel = 1
+            for dim in shape:
+                numel *= dim
+            if numel == 0:
+                # A 0-sized dimension makes "1/sqrt(elements)" meaningless
+                # (ZeroDivisionError, not a useful numeric answer). No
+                # known caller passes a 0-sized shape here today, but
+                # fail loudly with a clear error instead of leaving a
+                # bare ZeroDivisionError for whoever eventually reuses
+                # this function with a shape it wasn't tested against.
+                raise ValueError(
+                    f"random_tensor(mode='recommendation', role='weight') "
+                    f"got a 0-sized shape {shape!r}; 1/sqrt(numel) is "
+                    f"undefined for numel == 0."
+                )
+            std = 1 / (numel**0.5)
+            fp_tensor = torch.randn(shape, device=dev) * std
+        elif role == "input":
+            # Recommendation-style input features are typically already
+            # min-max normalized into [0, 1).
+            fp_tensor = torch.rand(shape, device=dev)
+        else:
+            raise ValueError(f"Unknown random_tensor role: {role!r}")
+    else:
+        raise ValueError(f"Unknown random_tensor mode: {mode!r}")
 
     if dtype.is_floating_point:
         return fp_tensor.to(dtype)
@@ -275,10 +337,12 @@ class SymbolNet(nn.Module):
         init_tensors: Dict[str, torch.Tensor],
         use_cuda=False,
         max_time=None,
+        max_steps: int = None,
         **kwargs,
     ) -> Optional[Dict[str, torch.Tensor]]:
-        # TODO: trim the param. max_iter is not used; remove getenv
-        if max_time is None:
+        if max_steps is not None and max_steps < 1:
+            raise ValueError("max_steps must be positive")
+        if max_steps is None and max_time is None:
             max_time = float(os.getenv("NNSMITH_GRAD_TIME", 0.5))
 
         inputs: Dict[str, torch.Tensor] = {}
@@ -299,10 +363,15 @@ class SymbolNet(nn.Module):
             self.use_cuda()
 
         sat_inputs = None
-        st = time.time()
+        st = time.time() if max_steps is None else None
         self.n_iter = 0
         self.cur_loss_name = None
-        while time.time() - st < max_time:
+        # A fixed step budget makes seeded numeric refinement independent
+        # of machine load, debug logging and NNSMITH_GRAD_TIME.
+        while (
+            self.n_iter < max_steps if max_steps is not None
+            else time.time() - st < max_time
+        ):
             self.training_reset()
             self.n_iter += 1
 

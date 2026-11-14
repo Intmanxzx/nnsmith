@@ -87,21 +87,44 @@ class TorchModel(Model, ABC):
     def gir_name() -> str:
         return "gir.pkl"
 
-    def refine_weights(self) -> None:
+    def refine_weights(
+        self, value_dist_mode: str = "uniform", max_search_steps: Optional[int] = None
+    ) -> None:
         self.torch_model.enable_proxy_grad()
         use_cuda = self.device().type == "cuda"
-        searcher = PracticalHybridSearch(self.torch_model, use_cuda=use_cuda)
+        max_sample = 2
+        start_inputs = None
+        if value_dist_mode != "uniform":
+            # Pre-sample `max_sample` inputs under the requested
+            # distribution so that, if any of PracticalHybridSearch's
+            # `max_sample` attempts validates, the resulting sat_inputs
+            # keeps that distribution's characteristics instead of silently
+            # falling back to get_random_inps()'s default uniform sampling
+            # (which search() uses internally for any attempt past the end
+            # of start_inputs). One pre-sampled input alone isn't enough:
+            # search() only reuses start_inputs[n_try] for as many tries as
+            # the list has entries, so the list needs to cover every
+            # attempt search() might make (max_sample of them), not just
+            # the first one.
+            start_inputs = [
+                self.torch_model.get_random_inps(use_cuda=use_cuda, mode=value_dist_mode)
+                for _ in range(max_sample)
+            ]
+        searcher = PracticalHybridSearch(
+            self.torch_model, start_inputs=start_inputs, use_cuda=use_cuda
+        )
         # TODO(@ganler): Can we directly get both inputs and outputs?
         _, inputs = searcher.search(
-            max_time_ms=20,
-            max_sample=2,
+            max_time_ms=20 if max_search_steps is None else None,
+            max_sample=max_sample,
+            max_steps=max_search_steps,
         )
         if inputs:
             self.sat_inputs = inputs
         self.torch_model.disable_proxy_grad()
 
-    def make_oracle(self) -> Oracle:
-        inputs = self.sat_inputs or self.torch_model.get_random_inps()
+    def make_oracle(self, **kwargs) -> Oracle:
+        inputs = self.sat_inputs or self.torch_model.get_random_inps(**kwargs)
 
         # Return NumPy array as outputs
         input_dict = {k: v.cpu().detach().numpy() for k, v in inputs.items()}

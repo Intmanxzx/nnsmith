@@ -237,7 +237,12 @@ class BackendFactory(ABC):
                 )
 
     def verify_results(
-        self, output: Dict[str, np.ndarray], testcase: TestCase, equal_nan=True
+        self,
+        output: Dict[str, np.ndarray],
+        testcase: TestCase,
+        equal_nan=True,
+        rtol=1e-2,
+        atol=1e-3,
     ) -> Optional[BugReport]:
         try:  # verification
             assert_allclose(
@@ -246,6 +251,8 @@ class BackendFactory(ABC):
                 self.__str__(),
                 testcase.oracle.provider,
                 equal_nan=equal_nan,
+                rtol=rtol,
+                atol=atol,
             )
         except AssertionError:
             return BugReport(
@@ -267,7 +274,7 @@ class BackendFactory(ABC):
             )
 
     def verify_testcase(
-        self, testcase: TestCase, equal_nan=True
+        self, testcase: TestCase, equal_nan=True, rtol=1e-2, atol=1e-3
     ) -> Optional[BugReport]:
         executable = self.checked_compile(testcase)
         if isinstance(executable, BugReport):
@@ -278,7 +285,9 @@ class BackendFactory(ABC):
             return output
 
         if testcase.oracle is not None and testcase.oracle.output is not None:
-            return self.verify_results(output, testcase, equal_nan=equal_nan)
+            return self.verify_results(
+                output, testcase, equal_nan=equal_nan, rtol=rtol, atol=atol
+            )
 
         return None
 

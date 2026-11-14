@@ -22,7 +22,10 @@ from nnsmith.abstract.tensor import AbsTensor
 from nnsmith.error import ConstraintCheck, SanityCheck
 
 __MIN_RANK__ = 0
-__MAX_RANK__ = 5
+# Overridable via NNSMITH_MAX_RANK for experiments needing deeper tensors
+# (e.g. probing KV-cache-style high-rank shapes); default 5 is unchanged so
+# existing --repro-seed batches stay reproducible without opting in.
+__MAX_RANK__ = int(os.environ.get("NNSMITH_MAX_RANK", "5"))
 
 FULL_OPERATOR_SETS: Dict[str, List[Type["AbsOpBase"]]] = dict()
 
@@ -72,6 +75,49 @@ def rank_until(end):
 
 def rank_all():
     return tuple(range(__MIN_RANK__, __MAX_RANK__ + 1))
+
+
+def weighted_axis_choice(ndims: int, boundary_weight: int = 3) -> int:
+    """Pick an axis in [0, ndims) with axis 0 and axis ndims-1 (the
+    boundary axes) each `boundary_weight`x more likely than any interior
+    axis. Replaces plain `random.randint(0, ndims - 1)` at every axis-choice
+    call site (Slice/ReduceBase/Transpose/Unsqueeze/Concat) so boundary-axis
+    coverage is consistently enriched everywhere instead of each call site
+    reimplementing its own ad hoc weighting. boundary_weight=3 is a starting
+    point, tune after a real hardware batch shows the actual boundary-axis
+    hit rate.
+    """
+    if ndims <= 1:
+        return 0
+    if ndims == 2:
+        # both axes ARE the boundary; uniform is already correct, weighting
+        # would be a no-op computed the hard way.
+        return random.randint(0, 1)
+    weights = [boundary_weight] + [1] * (ndims - 2) + [boundary_weight]
+    return random.choices(range(ndims), weights=weights, k=1)[0]
+
+
+def weighted_axis_sample(
+    ndims: int, k: int, boundary_weight: int = 3
+) -> List[int]:
+    """Pick `k` distinct axes out of [0, ndims) using the same boundary
+    weighting as `weighted_axis_choice`, without replacement: draw one axis
+    weighted over the remaining candidates, remove it, repeat. Used for
+    multi-axis reduce (`MultiAxisReduceBase`) so picking several axes keeps
+    the same boundary-axis coverage bias as picking one.
+    """
+    k = min(k, ndims)
+    remaining = list(range(ndims))
+    chosen = []
+    for _ in range(k):
+        weights = [
+            boundary_weight if (axis == 0 or axis == ndims - 1) else 1
+            for axis in remaining
+        ]
+        pick = random.choices(remaining, weights=weights, k=1)[0]
+        chosen.append(pick)
+        remaining.remove(pick)
+    return sorted(chosen)
 
 
 def check_shape_fn(func):
@@ -1013,7 +1059,7 @@ class Slice(UnaryOpBase):
         ConstraintCheck.true(ndims > 0)
         if "axis" not in self.extra_attrs:
             self.extra_attrs["ndims"] = ndims
-            self.extra_attrs["axis"] = random.randint(0, ndims - 1)
+            self.extra_attrs["axis"] = weighted_axis_choice(ndims)
             # specifying the region of the start and end pointer.
             # start \in [0, dim_s-1] if region=='right' else [-dim_s, -1]
             # end \in [-dim_s, -1] if region=='left' else [0, dim_s]
@@ -1070,6 +1116,137 @@ class Slice(UnaryOpBase):
         self, out_abs_tensor: List[AbsTensor]
     ) -> List[Tuple[int, DType]]:
         return [(out_abs_tensor[0].ndims, out_abs_tensor[0].dtype)]
+
+
+@mark_materialize("core")
+class IndexSelect(AbsOpBase):
+    """torch.index_select(data, axis, index) -- selects along `axis` using a
+    1D integer index tensor, output's `axis` dim becomes len(index).
+
+    NOTE on a framework gap this op works around: NNSmith's z3-driven input
+    generation only ever constrains *shape* and *dtype* of a tensor -- there
+    is no existing mechanism anywhere in the codebase to constrain a
+    tensor's *runtime values* (e.g. "every element of this int tensor must
+    be < N"). random_tensor() in symbolnet.py generates index's concrete
+    values the same way it would for any other int tensor (roughly centered
+    in [3,7] by default), which can easily be >= the selected axis's size or
+    even negative, and torch.index_select has undefined/crashing behavior
+    for out-of-range indices. Rather than threading a new "this is an index
+    input, clamp it" concept through random_tensor()/get_random_inps() (a
+    framework-wide change touching every op, not just this one), the forward
+    pass below clamps the raw generated index tensor into [0, dim_size) with
+    `torch.remainder` right before calling the real op -- fully contained in
+    this op's own forward_fn, zero changes to shared input-generation code.
+    """
+
+    # (data_dtype, index_dtype) pairs. Real aten.index_select (and ascendc's
+    # since=Soc.A5 _LoweringGuard.support registration for it) requires the
+    # index tensor to be int32 or int64 -- never any of the float/bool/etc
+    # dtypes a same-dtype BinaryOpBase-style pairing would allow.
+    in_dtypes = [(i, DType.int32) for i in DTYPE_GEN_FLOATS] + [
+        (i, DType.int64) for i in DTYPE_GEN_FLOATS
+    ]
+    out_dtypes = [(i,) for i in DTYPE_GEN_FLOATS] + [(i,) for i in DTYPE_GEN_FLOATS]
+
+    def __init__(self):
+        super().__init__()
+        # data: rank >= 1 (torch.index_select has no notion of an "axis" on
+        # a 0-d/scalar tensor -- confirmed hit in practice: rank_all()
+        # includes 0 since __MIN_RANK__ == 0, and _get_axis() below would
+        # call random.randint(0, -1) for a 0-d data tensor, which raises
+        # "empty range in randrange(0, 0)"). index: 1D only.
+        self.inp_ranks = [rank_from(1), (1,)]
+        self.out_ranks = [rank_all()]
+
+    def _get_axis(self, ndims):
+        if "axis" not in self.extra_attrs:
+            self.extra_attrs["axis"] = random.randint(0, ndims - 1)
+        return self.extra_attrs["axis"]
+
+    def requires(self, input_shapes: List[AbsTensor]):
+        data, index = input_shapes
+        self._get_axis(data.ndims)
+        # index must carry at least one element to select; its own length
+        # is otherwise a free symbol (it becomes the output's axis-dim size).
+        return [nnsmith_ge(index.shape[0], 1)]
+
+    def type_transfer(self, input_shapes: List[AbsTensor]) -> List[AbsTensor]:
+        data, index = input_shapes
+        axis = self._get_axis(data.ndims)
+        s = list(data.shape)
+        s[axis] = index.shape[0]
+        return [AbsTensor(s, data.dtype)]
+
+    def deduct_inp_ranks_and_dtype(
+        self, out_abs_tensor: List[AbsTensor]
+    ) -> List[Tuple[int, DType]]:
+        # Only called to *infer* a compatible input when this op is placed
+        # as a graph's last node and the output type is already fixed --
+        # index dtype defaults to int64 here (both int32/int64 are valid;
+        # int64 matches torch's own index_select default index dtype).
+        return [(out_abs_tensor[0].ndims, out_abs_tensor[0].dtype), (1, DType.int64)]
+
+
+@mark_materialize("core")
+class Gather(AbsOpBase):
+    """torch.gather(data, dim, index) -- aten.gather. Unlike an index_select-style
+    op, `index` must have the SAME rank as `data`, and the same size as `data`
+    in every dim except `dim` itself (dim's size in `index` is free -- it
+    becomes the output's size at `dim`). ascendc's gather_lowering.py
+    registers aten.gather separately from aten.index_select (both
+    since=Soc.A5, both float_dtypes()+(int32,int64) on the `data` slot),
+    so this is a distinct op, not a duplicate of index_select's shape model.
+
+    z3 only constrains index's *shape*, never its runtime element values, so
+    out-of-range index values (>= dim_size or negative) are folded back into
+    [0, dim_size) with torch.remainder in forward_fn, not in requires().
+    """
+
+    in_dtypes = [(i, DType.int32) for i in DTYPE_GEN_FLOATS] + [
+        (i, DType.int64) for i in DTYPE_GEN_FLOATS
+    ]
+    out_dtypes = [(i,) for i in DTYPE_GEN_FLOATS]
+
+    def __init__(self):
+        super().__init__()
+        # data: rank >= 1 (dim must be a valid axis; a 0-d data tensor has
+        # no axis to gather along -- random.randint(0, -1) would raise).
+        # index: same rank as data (torch.gather requires index.dim() ==
+        # data.dim()), enforced by z3 equality on ndims via same inp_ranks
+        # pairing handled in requires() below (both operands independently
+        # drawn from rank_from(1), then requires() ties them together --
+        # NNSmith has no direct "two inputs must share rank" rank_choice
+        # mechanism, so the tie is a shape constraint instead).
+        self.inp_ranks = [rank_from(1), rank_from(1)]
+        self.out_ranks = [rank_all()]
+
+    def _get_axis(self, ndims):
+        if "axis" not in self.extra_attrs:
+            self.extra_attrs["axis"] = random.randint(0, ndims - 1)
+        return self.extra_attrs["axis"]
+
+    def requires(self, input_shapes: List[AbsTensor]):
+        data, index = input_shapes
+        axis = self._get_axis(data.ndims)
+        cons = [nnsmith_eq(data.ndims, index.ndims)]
+        for d in range(data.ndims):
+            if d != axis:
+                cons.append(nnsmith_eq(data.shape[d], index.shape[d]))
+        cons.append(nnsmith_ge(index.shape[axis], 1))
+        return cons
+
+    def type_transfer(self, input_shapes: List[AbsTensor]) -> List[AbsTensor]:
+        data, index = input_shapes
+        axis = self._get_axis(data.ndims)
+        s = list(data.shape)
+        s[axis] = index.shape[axis]
+        return [AbsTensor(s, data.dtype)]
+
+    def deduct_inp_ranks_and_dtype(
+        self, out_abs_tensor: List[AbsTensor]
+    ) -> List[Tuple[int, DType]]:
+        ndims = out_abs_tensor[0].ndims
+        return [(ndims, out_abs_tensor[0].dtype), (ndims, DType.int64)]
 
 
 def _pad_num_var_param(rstart=1, max=None):
@@ -1286,6 +1463,93 @@ class BatchNorm2d(ElementWiseUnaryOp):
             nnsmith_eq(self.nfeat, input_shapes[0].shape[1]),
             nnsmith_ge(input_shapes[0].shape[0], 2),
         ]  # batch size = 1 -> fail training.
+
+
+@mark_materialize("core")
+class LayerNorm(ElementWiseUnaryOp):
+    """torch.nn.functional.layer_norm -- aten.native_layer_norm. ascendc has
+    no direct _LoweringGuard registration for this op; it only fuses via
+    decomposition.py's _layer_norm_decompose override, which only applies
+    when the input's numel is a static int (not a SymInt) -- i.e. this op's
+    fusability depends on NNSmith having already concretized the shape by
+    the time forward_fn runs (true for SymbolicGen's make_concrete() path,
+    but confirm with a real A5 run before relying on it, not by assumption).
+
+    normalized_shape is fixed to the input's last `norm_ndims` dims.
+    forward_fn never constructs or passes weight/bias (it calls
+    torch.nn.functional.layer_norm with the default weight=None, bias=None),
+    so this op has no affine parameters at all -- the [1, 128] bound in
+    requires() below is NOT about resolving normalized_shape into a concrete
+    size for some weight/bias tensor. It exists purely for solver-friendliness:
+    keeping generated shapes (and therefore z3 solving time) in a reasonable
+    range. inp.shape[d] remains a z3 symbol throughout requires() -- bounding
+    its range narrows the symbol, it does not turn it into a resolved integer.
+
+    __init__ takes no constructor parameters (like Gather), because nnsmith's
+    generator (graph_gen.py's try_insert_node_type) calls
+    node_t.get_num_var_param() z3.Int symbols into node_t(*op_params) --
+    get_num_var_param() defaults to counting __init__'s declared parameters,
+    so a parameterized norm_ndims would receive a z3 symbol, not a concrete
+    Python int. Doing `assert norm_ndims >= 1` or rank_from(norm_ndims + 1)
+    on that symbol raises (z3 expressions can't be cast to bool/int). Instead,
+    norm_ndims is decided lazily the first time it's needed (requires() /
+    deduct_inp_ranks_and_dtype()), cached in self.extra_attrs, exactly like
+    Gather._get_axis -- at that point the input rank is a concrete Python int
+    (AbsTensor.ndims), so random.randint is safe to call on it.
+    """
+
+    in_dtypes = [(DType.float32,)]
+    out_dtypes = [(DType.float32,)]
+
+    def __init__(self):
+        super().__init__()
+        # inp_ranks/out_ranks must not depend on norm_ndims (norm_ndims isn't
+        # even chosen yet at construction time). rank_from(2) requires at
+        # least one leading "batch" dim plus >=1 dim to normalize over --
+        # torch.nn.functional.layer_norm itself allows norm_ndims == input
+        # rank, but NNSmith's op model keeps a leading dim free so this op
+        # composes like other UnaryOpBase ops that preserve rank from a
+        # non-trivial predecessor.
+        self.inp_ranks = [rank_from(2)]
+        self.out_ranks = [rank_from(2)]
+
+    def _get_norm_ndims(self, ndims):
+        # Lazy, like Gather._get_axis: ndims here is a concrete Python int
+        # (AbsTensor.ndims), never a z3 symbol, so random.randint is safe.
+        # Picked once per op instance and cached, since requires() and
+        # deduct_inp_ranks_and_dtype()/forward_fn must all agree on the same
+        # value for a given instance.
+        if "norm_ndims" not in self.extra_attrs:
+            self.extra_attrs["norm_ndims"] = random.randint(1, ndims - 1)
+        return self.extra_attrs["norm_ndims"]
+
+    @property
+    def norm_ndims(self):
+        # forward_fn (nnsmith/materialize/torch/forward.py) reads op.norm_ndims
+        # directly; it always runs after requires()/deduct_inp_ranks_and_dtype()
+        # have already fixed the value in extra_attrs for this instance.
+        return self.extra_attrs["norm_ndims"]
+
+    def requires(self, input_shapes: List[AbsTensor]) -> List[Union[z3.BoolRef, bool]]:
+        inp = input_shapes[0]
+        norm_ndims = self._get_norm_ndims(inp.ndims)
+        # [1, 128] is a solver-friendliness bound on the normalized dims'
+        # sizes -- keeps generated shapes and z3 solving time reasonable.
+        # This op has no weight/bias (forward_fn passes none), so this is
+        # NOT about resolving normalized_shape into a concrete size for an
+        # affine parameter's shape. inp.shape[d] stays a free z3 symbol
+        # here; bounding it only narrows its range.
+        cons = []
+        for d in range(inp.ndims - norm_ndims, inp.ndims):
+            cons.append(nnsmith_ge(inp.shape[d], 1))
+            cons.append(nnsmith_le(inp.shape[d], 128))
+        return cons
+
+    def deduct_inp_ranks_and_dtype(
+        self, out_abs_tensor: List[AbsTensor]
+    ) -> List[Tuple[int, DType]]:
+        self._get_norm_ndims(out_abs_tensor[0].ndims)
+        return [(out_abs_tensor[0].ndims, DType.float32)]
 
 
 @mark_materialize("core")
@@ -1627,8 +1891,14 @@ class Transpose(UnaryOpBase):
         ConstraintCheck.ge(len(input_shape), 2)
         self.inp_ranks = [len(input_shape)]
         if "dim0" not in self.extra_attrs or "dim1" not in self.extra_attrs:
-            max_dim = len(input_shape) - 1
-            self.extra_attrs["dim0"] = random.randint(0, max_dim)
+            ndims = len(input_shape)
+            self.extra_attrs["dim0"] = weighted_axis_choice(ndims)
+            # dim1 must differ from dim0 -- keep the original "offset by a
+            # random nonzero amount, wrap around" construction (uniform over
+            # the ndims-1 remaining choices) rather than re-deriving a
+            # second independently-weighted pick that could coincide with
+            # dim0 and need a retry loop.
+            max_dim = ndims - 1
             self.extra_attrs["dim1"] = (
                 random.randint(1, max_dim) + self.extra_attrs["dim0"]
             ) % (1 + max_dim)
@@ -1726,9 +1996,12 @@ class ReduceBase(UnaryOpBase, ABC):
     def _init_reduce_dim(self, input_shape: List[Union[int, z3.ExprRef]]):
         if "reduce_dim" not in self.extra_attrs:
             if len(input_shape) == 0:
+                # 0-d input has no axis to reduce; keep returning None here
+                # rather than routing through weighted_axis_choice, which
+                # would return 0 and silently pick a nonexistent axis.
                 self.extra_attrs["reduce_dim"] = None
             else:
-                self.extra_attrs["reduce_dim"] = random.randint(0, len(input_shape) - 1)
+                self.extra_attrs["reduce_dim"] = weighted_axis_choice(len(input_shape))
         return self.extra_attrs["reduce_dim"]
 
     def type_transfer(self, input_shapes: List[AbsTensor]) -> List[AbsTensor]:
@@ -1771,6 +2044,69 @@ class Squeeze(ReduceBase):
         return [nnsmith_eq(input_shapes[0].shape[reduce_dim], 1)]
 
 
+class MultiAxisReduceBase(ReduceBase, ABC):
+    """`ReduceBase` variant where `reduce_dim` is a list of distinct axes
+    instead of a single int. The axis *count* must be decided before the
+    input shape/rank is known (graph_gen.py calls
+    `deduct_inp_ranks_and_dtype` before any input tensor exists), so it is
+    lazily chosen and cached in `extra_attrs["reduce_dim_count"]` the same
+    way `reduce_dim` itself is cached by the base class. The axis
+    *positions* are chosen once the real input rank is known (via
+    `weighted_axis_sample`, the without-replacement counterpart of
+    `weighted_axis_choice` used by the single-axis base class), same timing
+    as the single-axis case.
+    """
+
+    def _init_reduce_dim_count(self, max_count: int) -> int:
+        if "reduce_dim_count" not in self.extra_attrs:
+            self.extra_attrs["reduce_dim_count"] = random.randint(
+                1, max(1, max_count)
+            )
+        return self.extra_attrs["reduce_dim_count"]
+
+    def _init_reduce_dim(self, input_shape: List[Union[int, z3.ExprRef]]):
+        if "reduce_dim" not in self.extra_attrs:
+            if len(input_shape) == 0:
+                self.extra_attrs["reduce_dim"] = None
+            else:
+                count = self._init_reduce_dim_count(len(input_shape))
+                self.extra_attrs["reduce_dim"] = weighted_axis_sample(
+                    len(input_shape), count
+                )
+        return self.extra_attrs["reduce_dim"]
+
+    def type_transfer(self, input_shapes: List[AbsTensor]) -> List[AbsTensor]:
+        svar_list = []
+        dim_idx = self._init_reduce_dim(input_shapes[0].shape)
+        dims = set(dim_idx) if dim_idx is not None else set()
+        for i, v in enumerate(input_shapes[0].shape):
+            if i not in dims:
+                svar_list.append(v)
+        return [
+            AbsTensor(
+                svar_list,
+                self._reduce_out_dtype
+                if self._reduce_out_dtype
+                else input_shapes[0].dtype,
+            )
+        ]
+
+    def requires(self, input_shapes: List[AbsTensor]):
+        dim_idx = self._init_reduce_dim(input_shapes[0].shape)
+        if dim_idx is None:
+            return []
+        return [nnsmith_neq(input_shapes[0].shape[d], 0) for d in dim_idx]
+
+    def _get_irank(self, orank):
+        count = self._init_reduce_dim_count(orank + 1)
+        return orank + count
+
+    def deduct_inp_ranks_and_dtype(
+        self, out_abs_tensor: List[AbsTensor]
+    ) -> List[Tuple[int, DType]]:
+        return [(self._get_irank(out_abs_tensor[0].ndims), out_abs_tensor[0].dtype)]
+
+
 @mark_materialize("core")
 class Unsqueeze(UnaryOpBase):
     in_dtypes = [(i,) for i in DTYPE_GEN_ALL]
@@ -1789,7 +2125,13 @@ class Unsqueeze(UnaryOpBase):
 
     def _init_expand_dim(self, input_shapes: List[Union[int, z3.ExprRef]]):
         if "expand_dim" not in self.extra_attrs:
-            self.extra_attrs["expand_dim"] = random.randint(0, len(input_shapes))
+            # Unsqueeze's expand_dim ranges over [0, ndims] (ndims+1 valid
+            # insertion points, including "after the last dim"), one more
+            # than weighted_axis_choice's [0, ndims) -- call it with ndims+1
+            # so position 0 and position ndims are both treated as boundary.
+            self.extra_attrs["expand_dim"] = weighted_axis_choice(
+                len(input_shapes) + 1
+            )
         return self.extra_attrs["expand_dim"]
 
     def type_transfer(self, input_shapes: List[AbsTensor]) -> List[AbsTensor]:
@@ -1805,25 +2147,25 @@ class Unsqueeze(UnaryOpBase):
 
 
 @mark_materialize("core")
-class ReduceSum(ReduceBase):
+class ReduceSum(MultiAxisReduceBase):
     in_dtypes = [(i,) for i in DTYPE_GEN_NON_BOOL]
     out_dtypes = [(i,) for i in DTYPE_GEN_NON_BOOL]
 
 
 @mark_materialize("core")
-class ReduceMin(ReduceBase):
+class ReduceMin(MultiAxisReduceBase):
     in_dtypes = [(i,) for i in DTYPE_GEN_FLOATS + DTYPE_GEN_INTS]
     out_dtypes = [(i,) for i in DTYPE_GEN_FLOATS + DTYPE_GEN_INTS]
 
 
 @mark_materialize("core")
-class ReduceMax(ReduceBase):
+class ReduceMax(MultiAxisReduceBase):
     in_dtypes = [(i,) for i in DTYPE_GEN_FLOATS + DTYPE_GEN_INTS]
     out_dtypes = [(i,) for i in DTYPE_GEN_FLOATS + DTYPE_GEN_INTS]
 
 
 @mark_materialize("core")
-class ReduceMean(ReduceBase):
+class ReduceMean(MultiAxisReduceBase):
     in_dtypes = [(i,) for i in DTYPE_GEN_FLOATS]
     out_dtypes = [(i,) for i in DTYPE_GEN_FLOATS]
 
@@ -1919,7 +2261,7 @@ class Concat(AbsOpBase):
 
     def _init_concat_axis(self, input_shapes: List[AbsTensor]) -> int:
         if "axis" not in self.extra_attrs:
-            self.extra_attrs["axis"] = random.randint(0, input_shapes[0].ndims - 1)
+            self.extra_attrs["axis"] = weighted_axis_choice(input_shapes[0].ndims)
         return self.extra_attrs["axis"]
 
     def requires(self, input_shapes: List[AbsTensor]) -> List[Union[z3.BoolRef, bool]]:

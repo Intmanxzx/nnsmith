@@ -8,6 +8,7 @@ class DType(Enum):
     float16 = "float16"
     float32 = "float32"
     float64 = "float64"
+    bfloat16 = "bfloat16"
     uint8 = "uint8"  # Support quantized models.
     uint16 = "uint16"
     uint32 = "uint32"
@@ -33,6 +34,7 @@ class DType(Enum):
             DType.float16: "f16",
             DType.float32: "f32",
             DType.float64: "f64",
+            DType.bfloat16: "bf16",
             DType.uint8: "u8",
             DType.uint16: "u16",
             DType.uint32: "u32",
@@ -47,7 +49,7 @@ class DType(Enum):
         }[self]
 
     def is_float(self):
-        return self in [DType.float16, DType.float32, DType.float64]
+        return self in [DType.float16, DType.float32, DType.float64, DType.bfloat16]
 
     @staticmethod
     def from_str(s):
@@ -55,6 +57,7 @@ class DType(Enum):
             "f16": DType.float16,
             "f32": DType.float32,
             "f64": DType.float64,
+            "bf16": DType.bfloat16,
             "u8": DType.uint8,
             "i8": DType.int8,
             "i32": DType.int32,
@@ -64,6 +67,7 @@ class DType(Enum):
             "float16": DType.float16,
             "float32": DType.float32,
             "float64": DType.float64,
+            "bfloat16": DType.bfloat16,
             "uint8": DType.uint8,
             "uint16": DType.uint16,
             "uint32": DType.uint32,
@@ -78,10 +82,13 @@ class DType(Enum):
         }[s]
 
     def numpy(self):
+        import ml_dtypes
+
         return {
             DType.float16: np.float16,
             DType.float32: np.float32,
             DType.float64: np.float64,
+            DType.bfloat16: ml_dtypes.bfloat16,
             DType.uint8: np.uint8,
             DType.uint8: np.uint8,
             DType.uint16: np.uint16,
@@ -103,6 +110,7 @@ class DType(Enum):
             DType.float16: torch.float16,
             DType.float32: torch.float32,
             DType.float64: torch.float64,
+            DType.bfloat16: torch.bfloat16,
             DType.uint8: torch.uint8,
             # PyTorch does not support other unsigned int types: https://github.com/pytorch/pytorch/issues/58734
             DType.int8: torch.int8,
@@ -122,6 +130,7 @@ class DType(Enum):
             torch.float16: DType.float16,
             torch.float32: DType.float32,
             torch.float64: DType.float64,
+            torch.bfloat16: DType.bfloat16,
             torch.uint8: DType.uint8,
             torch.int8: DType.int8,
             torch.int16: DType.int16,
@@ -178,6 +187,7 @@ class DType(Enum):
             DType.float16: 2,
             DType.float32: 4,
             DType.float64: 8,
+            DType.bfloat16: 2,
             DType.uint8: 1,
             DType.uint16: 2,
             DType.uint32: 4,
@@ -196,7 +206,7 @@ class DType(Enum):
 # "DTYPE_GEN_ALL" is surely a subset of all types but it is
 # used to conservatively to avoid unsupported data types while
 # applying nnsmith to various frameworks.
-DTYPE_GEN_FLOATS = [DType.float16, DType.float32, DType.float64]
+DTYPE_GEN_FLOATS = [DType.float16, DType.float32, DType.float64, DType.bfloat16]
 DTYPE_GEN_INTS = [
     DType.int8,
     DType.int16,

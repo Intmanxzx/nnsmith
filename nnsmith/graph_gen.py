@@ -1,4 +1,5 @@
 import logging
+import math
 import random
 import time
 import traceback
@@ -28,6 +29,71 @@ def concretize_graph(ir: GraphIR, model: z3.ModelRef) -> GraphIR:
     return ir.concretize(model)
 
 
+def _sample_dim_size(l: int, r: int, dist_mode: str) -> int:
+    """Sample one dimension's size from `[l, r]` (inclusive) under `dist_mode`.
+
+    "uniform" (default, unchanged behavior): `random.randint(l, r)`, every
+    value in range equally likely.
+
+    "log_normal": skews toward small values while still occasionally
+    reaching the upper bound, instead of every size in `[l, r]` being
+    equally likely -- useful for large ranges (e.g. r=131072) where most
+    generated cases should stay small/medium and only a few should probe
+    the extreme end. Implemented as a normal distribution in log-space,
+    re-exponentiated and clamped back into `[l, r]`:
+      mu = log(l) + 0.3 * (log(r) - log(l))   # mean sits 30% of the way
+                                               # from log(l) to log(r), not
+                                               # at log(l) itself -- anchoring
+                                               # the mean exactly at log(l)
+                                               # makes the median collapse to
+                                               # l after clamping, since half
+                                               # the unclamped mass already
+                                               # falls below the mean
+      sigma = (log(r) - log(l)) / 3.5         # wide enough that the tail
+                                               # reaches r with non-negligible
+                                               # (but still a few-percent)
+                                               # probability, not so wide that
+                                               # values pile up at the r clamp
+    These two constants were picked by simulating the resulting distribution
+    across this project's actual (l, r) ranges (8..16384 up to 8..131072) and
+    checking the resulting percentiles/clamp rate were reasonable -- not
+    derived from a formula, so if the (l, r) ranges this is used with change
+    drastically, re-simulate rather than assuming these still hold.
+
+    "half_normal": density is highest at `l` and strictly decreases toward
+    `r` (unlike "log_normal", which peaks at some interior value) -- for
+    callers that want "small shapes common, large shapes rare" with no
+    interior mode. Implemented as the absolute value of a zero-mean normal,
+    shifted so its mode sits at `l`:
+      sigma = (r - l) / 3.0   # wide enough that r is reachable with
+                               # non-negligible probability, not so wide
+                               # that the clamp at r dominates the mass
+      v = l + |gauss(0, sigma)|, clamped to r
+    """
+    if dist_mode == "uniform":
+        return random.randint(l, r)
+    if dist_mode == "half_normal":
+        if l >= r:
+            return l
+        sigma = (r - l) / 3.0
+        v = int(round(l + abs(random.gauss(0, sigma))))
+        return max(l, min(r, v))
+    if dist_mode != "log_normal":
+        raise ValueError(
+            f"Unknown dist_mode {dist_mode!r}; expected 'uniform', "
+            "'log_normal', or 'half_normal'"
+        )
+    if l <= 0:
+        # log(0) is undefined; only reachable if some future caller passes
+        # l=0, which this project's (l, r) ranges never do (smallest is 8).
+        return random.randint(l, r)
+    log_l, log_r = math.log(l), math.log(r)
+    mu = log_l + 0.3 * (log_r - log_l)
+    sigma = (log_r - log_l) / 3.5
+    v = int(round(math.exp(random.gauss(mu, sigma))))
+    return max(l, min(r, v))
+
+
 class BaseGen:
     def __init__(
         self,
@@ -38,13 +104,15 @@ class BaseGen:
         max_elem_per_tensor: int = 2**16,
         rank_choices=None,
         dtype_choices=None,
+        dim_dist_mode: str = "uniform",
     ):
         assert len(opset) > 0, "opset must not be empty"
         if seed is not None:
             set_seed(seed)
 
         self.seed = seed
-        self.op_candidates = opset
+        # A seeded index only identifies an op if the candidate order is stable.
+        self.op_candidates = sorted(opset, key=lambda op: op.name())
         self.ir = GraphIR()
         self.monotonic_placeholder_id = 0
 
@@ -54,6 +122,7 @@ class BaseGen:
         self.forward_prob = 0.5 if forward_prob is None else forward_prob
         self.concr_ph_dim_rng = concr_ph_dim_rng
         self.max_elem_per_tensor = max_elem_per_tensor
+        self.dim_dist_mode = dim_dist_mode
         self.rank_choices = rank_choices if rank_choices else rank_all()
         # analyze the dtypes used by the opset
         dtype_top = set()
@@ -69,7 +138,9 @@ class BaseGen:
             else DTYPE_GEN_ALL
         )
 
-        self.dtype_choices = list(dtype_top.intersection(self.dtype_choices))
+        self.dtype_choices = sorted(
+            dtype_top.intersection(self.dtype_choices), key=str
+        )
         assert len(self.dtype_choices) > 0, "dtype_choices must not be empty"
         assert len(self.rank_choices) > 0, "rank_choices must not be empty"
 
@@ -103,7 +174,7 @@ class BaseGen:
         shape = []
         product = 1
         for _ in range(rank):
-            v = random.randint(l, r)
+            v = _sample_dim_size(l, r, self.dim_dist_mode)
             if product * v > self.max_elem_per_tensor:
                 v = 1
             shape.append(v)
@@ -182,10 +253,14 @@ class BaseGen:
         init_time = time.time()
 
         # starts generation.
-        while (
-            time.time() - init_time < max_gen_millisec / 1000
-            and self.num_op() < max_node_size
-        ):
+        while self.num_op() < max_node_size:
+            # A wall-clock cutoff must not silently produce a different partial
+            # graph for the same seed on a slower/busier machine.
+            if time.time() - init_time >= max_gen_millisec / 1000:
+                raise TimeoutError(
+                    f"Graph generation timed out after {max_gen_millisec} ms "
+                    f"(seed={self.seed}, nodes={self.num_op()}/{max_node_size})"
+                )
             if self.extra_exit_check(max_node_size):
                 break
             self.try_insert()
@@ -246,7 +321,7 @@ class BaseGen:
 
             SanityCheck.ge(len(rank_set), 1)
 
-            final_dim = random.choice(list(rank_set))
+            final_dim = random.choice(sorted(rank_set))
             dim_spec_list = [(final_dim,)] * n_inp
         else:  # inputs have different dimension sizes.
             dim_spec_list = op.inp_ranks
@@ -426,6 +501,10 @@ def check_sat(solver: z3.Solver, *assumptions) -> z3.CheckSatResult:
             SMT_LOG.debug(f"new constraints: {', '.join(map(str, assumptions))}")
 
     cres = solver.check(*assumptions)
+    if cres == z3.unknown:
+        # Treat a solver timeout as generation failure, not as an unsatisfiable
+        # op that can be skipped depending on the current machine load.
+        raise RuntimeError(f"SMT solver returned unknown: {solver.reason_unknown()}")
 
     if SMT_LOG.getEffectiveLevel() <= logging.DEBUG:
         SMT_LOG.debug(
@@ -474,11 +553,11 @@ class SymbolicGen(BaseGen):
         # Insert the first node.
         if symbolic_init:
             ph = self.make_symbolic_placeholder(
-                self.random_rank(), dtype=DType.float32 if init_fp else None
+                self.random_rank(), dtype=self.random_dtype_gen() if init_fp else None
             )
         else:
             ph = self.make_random_concrete_placeholder(
-                self.random_rank(), dtype=DType.float32 if init_fp else None
+                self.random_rank(), dtype=self.random_dtype_gen() if init_fp else None
             )
 
         self.insert_init_ph_node(ph)
@@ -658,7 +737,7 @@ class ConcolicGen(BaseGen):
         # Insert the first node.
         self.insert_init_ph_node(
             self.make_random_concrete_placeholder(
-                self.random_rank(), dtype=DType.float32 if init_fp else None
+                self.random_rank(), dtype=self.random_dtype_gen() if init_fp else None
             )
         )
 

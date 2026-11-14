@@ -154,11 +154,11 @@ class Model(ABC):
         pass
 
     @abstractmethod
-    def refine_weights(self) -> None:
+    def refine_weights(self, **kwargs) -> None:
         pass
 
     @abstractmethod
-    def make_oracle(self) -> Oracle:
+    def make_oracle(self, **kwargs) -> Oracle:
         pass
 
     @staticmethod

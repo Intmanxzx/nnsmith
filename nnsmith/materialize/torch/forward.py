@@ -296,6 +296,13 @@ def forward_fn(op: BatchNorm2d):
     return torch.nn.BatchNorm2d(num_features=op.nfeat)
 
 
+@operator_impl(LayerNorm)
+def forward_fn(op: LayerNorm):
+    return lambda x: torch.nn.functional.layer_norm(
+        x, normalized_shape=x.shape[-op.norm_ndims :]
+    )
+
+
 @operator_impl(Conv1d)
 def forward_fn(op: Conv1d):
     return torch.nn.Conv1d(
@@ -334,6 +341,54 @@ def forward_fn(op: Flatten):
 def forward_fn(op: Transpose):
     dim0, dim1 = op._init_swap_dims(op.input_like[0].shape)
     return lambda x: x.transpose(dim0, dim1)
+
+
+@operator_impl(IndexSelect)
+def forward_fn(op: IndexSelect):
+    axis = op.extra_attrs["axis"]
+
+    def _index_select(data, index):
+        # random_tensor() has no notion of "this is an index tensor" and may
+        # generate values outside [0, dim_size) or negative ones; remainder
+        # folds them back into range without biasing towards any one index
+        # (unlike clamp, which would pile everything onto the boundary).
+        dim_size = data.shape[axis]
+        safe_index = torch.remainder(index, dim_size)
+        # torch.index_select requires int64 index regardless of what dtype
+        # ascendc's _LoweringGuard registration allows at the aten-node
+        # level (int32 index is a legal *node* dtype but eager/aten rejects
+        # it at the kernel level with "Expected dtype int64 for index").
+        # Unconditional .to() -- NOT an `if safe_index.dtype != ...:` guard
+        # (confirmed hit in practice): AscendC.make_backend traces this
+        # forward_fn with torch.fx.symbolic_trace(), where `index` is a
+        # Proxy, not a real tensor, so `safe_index.dtype != torch.int64`
+        # cannot be evaluated as a Python bool -- that raises
+        # "TraceError: symbolically traced variables cannot be used as
+        # inputs to control flow". .to(torch.int64) is itself a no-op when
+        # already int64, so the conditional bought nothing anyway.
+        safe_index = safe_index.to(torch.int64)
+        return torch.index_select(data, axis, safe_index)
+
+    return _index_select
+
+
+@operator_impl(Gather)
+def forward_fn(op: Gather):
+    axis = op.extra_attrs["axis"]
+
+    def _gather(data, index):
+        # random_tensor() has no notion of "this is an index tensor"; fold
+        # out-of-range/negative values back into [0, dim_size) uniformly
+        # (remainder, not clamp, to avoid piling density on the boundary).
+        dim_size = data.shape[axis]
+        safe_index = torch.remainder(index, dim_size)
+        # Unconditional .to() -- NOT an `if` dtype guard: AscendC.make_backend
+        # traces this with torch.fx.symbolic_trace(), where `index` is a
+        # Proxy, so a Python-level dtype comparison would raise TraceError.
+        safe_index = safe_index.to(torch.int64)
+        return torch.gather(data, axis, safe_index)
+
+    return _gather
 
 
 # NearestInterp
@@ -384,16 +439,16 @@ def forward_fn(op: TorchReduceSum):
 @operator_impl(ReduceMin)
 def forward_fn(op: ReduceMin):
     if op.extra_attrs["reduce_dim"] is not None:
-        return lambda x: x.min(op.extra_attrs["reduce_dim"]).values
-    return lambda x: x.min()
+        return lambda x: x.amin(op.extra_attrs["reduce_dim"])
+    return lambda x: x.amin()
 
 
 # ReduceMax
 @operator_impl(ReduceMax)
 def forward_fn(op: ReduceMax):
     if op.extra_attrs["reduce_dim"] is not None:
-        return lambda x: x.max(op.extra_attrs["reduce_dim"]).values
-    return lambda x: x.max()
+        return lambda x: x.amax(op.extra_attrs["reduce_dim"])
+    return lambda x: x.amax()
 
 
 # ReduceMean
