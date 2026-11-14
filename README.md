@@ -1,3 +1,30 @@
+# AutofuseX NNSmith fork
+
+This fork contains the AscendC extensions used by AutofuseX. The Python import
+and distribution name remain nnsmith. Install this fork instead of upstream
+NNSmith in an execution environment.
+
+~~~sh
+python -m pip wheel --no-deps . -w dist
+python -m pip install ./dist/nnsmith-0.1.1+autofusex.2-py3-none-any.whl
+~~~
+
+Pip resolves Z3, NumPy, Hydra and setuptools. Torch and the platform-specific
+torch_npu/CANN stack are supplied by the execution environment. No consumer-side
+patch scripts are required.
+
+The fork starts at upstream bc0af42c7d5fc4fd201efb76e5313f6298c2d573.
+Commit 9b63a21 imports all 14 AutofuseX patches: IndexSelect, Gather/LayerNorm,
+tolerances, bfloat16, rank/axis weighting, value distributions, oracle keyword
+arguments, weight refinement, initial dtype diversity, dimension distributions,
+amin/amax lowering, multi-axis reduction, reproducible graph generation, and
+seeded numeric search. Subsequent changes are developed directly here.
+
+The upstream Apache-2.0 license and notices are retained. Original documentation
+follows below.
+
+---
+
 <div align="center">
     <img src="https://github.com/ganler/nnsmith-logo/raw/master/nnsmith-logo.png" align="right" alt="logo" width="200px"/>
 </div>
