@@ -6,7 +6,7 @@ NNSmith in an execution environment.
 
 ~~~sh
 python -m pip wheel --no-deps . -w dist
-python -m pip install ./dist/nnsmith-0.1.1+autofusex.2-py3-none-any.whl
+python -m pip install ./dist/nnsmith-0.1.2+autofusex.1-py3-none-any.whl
 ~~~
 
 Pip resolves Z3, NumPy, Hydra and setuptools. Torch and the platform-specific

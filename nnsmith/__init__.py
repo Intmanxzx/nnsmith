@@ -1,4 +1,9 @@
 try:
     from nnsmith._version import __version__, __version_tuple__
 except ImportError:
-    __version__ = "local-dev"
+    from importlib.metadata import PackageNotFoundError, version
+
+    try:
+        __version__ = version("nnsmith")
+    except PackageNotFoundError:
+        __version__ = "local-dev"
