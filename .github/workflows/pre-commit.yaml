@@ -9,6 +9,10 @@ jobs:
   pre-commit:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v3
-      - uses: actions/setup-python@v3
-      - uses: pre-commit/action@v3.0.0
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          # Without a pin this picks the newest Python, where black 22.6.0
+          # crashes on asyncio.get_event_loop() (Python 3.15+).
+          python-version: '3.11'
+      - uses: pre-commit/action@v3.0.1
