@@ -1,0 +1,158 @@
+name: Release to PyPI
+
+# GitCode has no `release` event, so the autofusex side triggers on tag push.
+# This fork lives on GitHub, where a published Release is the natural signal.
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      publish:
+        description: 'Actually upload to PyPI (unchecked = build and verify only)'
+        required: false
+        default: false
+        type: boolean
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install build tooling
+        run: |
+          set -eu
+          python -m pip install --upgrade pip
+          python -m pip install 'build==1.2.2.post1' 'twine==6.1.0' 'setuptools==75.8.0' 'wheel==0.45.1'
+
+      - name: Check version consistency
+        run: |
+          set -eu
+          python - <<'PY'
+          import configparser, re, sys
+          from pathlib import Path
+
+          cfg = configparser.ConfigParser()
+          cfg.read('setup.cfg')
+          name = cfg['metadata']['name']
+          version = cfg['metadata']['version']
+
+          if name != 'autofusex-nnsmith':
+              sys.exit(f'distribution name must be autofusex-nnsmith, got {name}')
+          if '+' in version:
+              sys.exit(f'local version label is rejected by PyPI: {version}')
+          if not re.fullmatch(r'\d+\.\d+\.\d+(\.(post|rc|b|a)\d+)?', version):
+              sys.exit(f'unexpected version: {version}')
+
+          # The import package must keep its historical name: autofusex imports "nnsmith".
+          if not Path('nnsmith/__init__.py').is_file():
+              sys.exit('import package nnsmith/ is missing')
+
+          print(f'{name} {version}: version checks OK')
+          PY
+
+      - name: Build wheel and sdist
+        run: |
+          set -eu
+          export SOURCE_DATE_EPOCH=$(git log -1 --format=%ct)
+          python -m build --outdir dist
+
+      - name: Verify metadata is PyPI-acceptable
+        run: |
+          set -eu
+          python -m twine check --strict dist/*
+          python - <<'PY'
+          import email, sys, zipfile
+          from pathlib import Path
+
+          for wheel in Path('dist').glob('*.whl'):
+              with zipfile.ZipFile(wheel) as archive:
+                  meta = [n for n in archive.namelist() if n.endswith('.dist-info/METADATA')][0]
+                  info = email.message_from_bytes(archive.read(meta))
+              # PyPI rejects direct URL dependencies in Requires-Dist.
+              bad = [r for r in (info.get_all('Requires-Dist') or []) if '@' in r]
+              if bad:
+                  sys.exit(f'{wheel.name} declares direct URL dependencies: {bad}')
+              if not any(n.startswith('nnsmith/') for n in zipfile.ZipFile(wheel).namelist()):
+                  sys.exit(f'{wheel.name} does not ship the nnsmith import package')
+              print(f'{info["Name"]} {info["Version"]}: metadata OK')
+          PY
+
+      - name: Smoke test the built wheel
+        run: |
+          set -eu
+          python -m venv /tmp/smoke
+          /tmp/smoke/bin/python -m pip install --quiet dist/*.whl
+          cd /tmp  # run outside the source tree so the checkout cannot shadow the wheel
+          /tmp/smoke/bin/python - <<'PY'
+          import importlib.metadata as md
+          import nnsmith
+          from pathlib import Path
+
+          version = md.version('autofusex-nnsmith')
+          assert nnsmith.__version__ == version, (nnsmith.__version__, version)
+          assert Path(nnsmith.__file__).resolve().parent.name == 'nnsmith'
+          import nnsmith.graph_gen, nnsmith.abstract, nnsmith.error  # noqa: F401
+          print(f'autofusex-nnsmith {version}: import and metadata OK')
+          PY
+
+      - name: Report source hash for autofusex pinning
+        run: |
+          set -eu
+          python - <<'PY'
+          import hashlib
+          from pathlib import Path
+          import nnsmith
+
+          root = Path(nnsmith.__file__).resolve().parent
+          digest = hashlib.sha256()
+          for path in sorted(root.rglob('*.py')):
+              digest.update(path.relative_to(root).as_posix().encode() + b'\0' + path.read_bytes())
+          print(f'autofusex SOURCE_SHA256 -> {digest.hexdigest()}')
+          print('Update autofusex/fuzz/generation/runtime.py to this value.')
+          PY
+        continue-on-error: true
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: distributions
+          path: dist/*
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    # Only publish on a real Release, or on a manual run that explicitly opted in.
+    if: >-
+      github.event_name == 'release' ||
+      (github.event_name == 'workflow_dispatch' && inputs.publish)
+    permissions:
+      id-token: write  # PyPI Trusted Publishing
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: distributions
+          path: dist
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Publish to PyPI
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          # Trusted Publishing is preferred (no long-lived token). If the project
+          # is not configured for it yet, set the PYPI_API_TOKEN secret and this
+          # falls back to a token upload.
+          password: ${{ secrets.PYPI_API_TOKEN }}
+          packages-dir: dist
