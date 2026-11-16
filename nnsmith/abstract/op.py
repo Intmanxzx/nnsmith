@@ -97,9 +97,7 @@ def weighted_axis_choice(ndims: int, boundary_weight: int = 3) -> int:
     return random.choices(range(ndims), weights=weights, k=1)[0]
 
 
-def weighted_axis_sample(
-    ndims: int, k: int, boundary_weight: int = 3
-) -> List[int]:
+def weighted_axis_sample(ndims: int, k: int, boundary_weight: int = 3) -> List[int]:
     """Pick `k` distinct axes out of [0, ndims) using the same boundary
     weighting as `weighted_axis_choice`, without replacement: draw one axis
     weighted over the remaining candidates, remove it, repeat. Used for
@@ -2059,9 +2057,7 @@ class MultiAxisReduceBase(ReduceBase, ABC):
 
     def _init_reduce_dim_count(self, max_count: int) -> int:
         if "reduce_dim_count" not in self.extra_attrs:
-            self.extra_attrs["reduce_dim_count"] = random.randint(
-                1, max(1, max_count)
-            )
+            self.extra_attrs["reduce_dim_count"] = random.randint(1, max(1, max_count))
         return self.extra_attrs["reduce_dim_count"]
 
     def _init_reduce_dim(self, input_shape: List[Union[int, z3.ExprRef]]):
@@ -2129,9 +2125,7 @@ class Unsqueeze(UnaryOpBase):
             # insertion points, including "after the last dim"), one more
             # than weighted_axis_choice's [0, ndims) -- call it with ndims+1
             # so position 0 and position ndims are both treated as boundary.
-            self.extra_attrs["expand_dim"] = weighted_axis_choice(
-                len(input_shapes) + 1
-            )
+            self.extra_attrs["expand_dim"] = weighted_axis_choice(len(input_shapes) + 1)
         return self.extra_attrs["expand_dim"]
 
     def type_transfer(self, input_shapes: List[AbsTensor]) -> List[AbsTensor]:

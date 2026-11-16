@@ -25,7 +25,13 @@ __ENABLE_RT_CHECK__ = os.getenv("NNSMITH_RT_CHECK", "0") == "1"
 
 # Probabilistically, sampling at positive domain is beneficial.
 def random_tensor(
-    shape, dtype: torch.dtype, margin=4, base=5, use_cuda=False, mode="uniform", role="input"
+    shape,
+    dtype: torch.dtype,
+    margin=4,
+    base=5,
+    use_cuda=False,
+    mode="uniform",
+    role="input",
 ):
     # center: -margin ~ 0 ~ +margin
     dev = torch.device("cuda" if use_cuda else "cpu")
@@ -369,7 +375,8 @@ class SymbolNet(nn.Module):
         # A fixed step budget makes seeded numeric refinement independent
         # of machine load, debug logging and NNSMITH_GRAD_TIME.
         while (
-            self.n_iter < max_steps if max_steps is not None
+            self.n_iter < max_steps
+            if max_steps is not None
             else time.time() - st < max_time
         ):
             self.training_reset()

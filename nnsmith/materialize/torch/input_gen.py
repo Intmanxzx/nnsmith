@@ -25,7 +25,9 @@ class InputSearchBase(ABC):
         self.use_cuda = use_cuda
 
     @abstractmethod
-    def search_one(self, start_inp, timeout_ms: int = None, max_steps: int = None) -> Dict[str, torch.Tensor]:
+    def search_one(
+        self, start_inp, timeout_ms: int = None, max_steps: int = None
+    ) -> Dict[str, torch.Tensor]:
         pass
 
     def search(
@@ -67,7 +69,9 @@ class InputSearchBase(ABC):
 
 class SamplingSearch(InputSearchBase):
     # Think about how people trivially generate inputs.
-    def search_one(self, start_inp, timeout_ms: int = None, max_steps: int = None) -> Dict[str, torch.Tensor]:
+    def search_one(
+        self, start_inp, timeout_ms: int = None, max_steps: int = None
+    ) -> Dict[str, torch.Tensor]:
         with torch.no_grad():
             self.net.check_intermediate_numeric = True
             _ = self.net(*start_inp.values())
@@ -78,10 +82,14 @@ class SamplingSearch(InputSearchBase):
 
 
 class GradSearch(InputSearchBase):
-    def search_one(self, start_inp, timeout_ms: int = None, max_steps: int = None) -> Dict[str, torch.Tensor]:
+    def search_one(
+        self, start_inp, timeout_ms: int = None, max_steps: int = None
+    ) -> Dict[str, torch.Tensor]:
         timeout_s = None if timeout_ms is None else timeout_ms / 1000
         return self.net.grad_input_gen(
-            init_tensors=start_inp, use_cuda=self.use_cuda, max_time=timeout_s,
+            init_tensors=start_inp,
+            use_cuda=self.use_cuda,
+            max_time=timeout_s,
             max_steps=max_steps,
         )
 
@@ -103,12 +111,18 @@ class PracticalHybridSearch(InputSearchBase):
         else:
             self.differentiable = False
 
-    def search_one(self, start_inp, timeout_ms: int = None, max_steps: int = None) -> Dict[str, torch.Tensor]:
+    def search_one(
+        self, start_inp, timeout_ms: int = None, max_steps: int = None
+    ) -> Dict[str, torch.Tensor]:
         # if this model is purely differentiable -> GradSearch
         # otherwise                              -> SamplingSearch
         # FIXME: Estimate gradient (e.g., proxy gradient) for non-differentiable inputs.
 
         if self.differentiable:
-            return GradSearch.search_one(self, start_inp, timeout_ms, max_steps=max_steps)
+            return GradSearch.search_one(
+                self, start_inp, timeout_ms, max_steps=max_steps
+            )
         else:
-            return SamplingSearch.search_one(self, start_inp, timeout_ms, max_steps=max_steps)
+            return SamplingSearch.search_one(
+                self, start_inp, timeout_ms, max_steps=max_steps
+            )

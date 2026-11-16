@@ -138,9 +138,7 @@ class BaseGen:
             else DTYPE_GEN_ALL
         )
 
-        self.dtype_choices = sorted(
-            dtype_top.intersection(self.dtype_choices), key=str
-        )
+        self.dtype_choices = sorted(dtype_top.intersection(self.dtype_choices), key=str)
         assert len(self.dtype_choices) > 0, "dtype_choices must not be empty"
         assert len(self.rank_choices) > 0, "rank_choices must not be empty"
 

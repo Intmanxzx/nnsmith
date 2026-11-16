@@ -107,7 +107,9 @@ class TorchModel(Model, ABC):
             # attempt search() might make (max_sample of them), not just
             # the first one.
             start_inputs = [
-                self.torch_model.get_random_inps(use_cuda=use_cuda, mode=value_dist_mode)
+                self.torch_model.get_random_inps(
+                    use_cuda=use_cuda, mode=value_dist_mode
+                )
                 for _ in range(max_sample)
             ]
         searcher = PracticalHybridSearch(
