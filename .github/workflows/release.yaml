@@ -48,8 +48,8 @@ jobs:
           name = cfg['metadata']['name']
           version = cfg['metadata']['version']
 
-          if name != 'autofusex-nnsmith':
-              sys.exit(f'distribution name must be autofusex-nnsmith, got {name}')
+          if name != 'nnsmith-autofusex':
+              sys.exit(f'distribution name must be nnsmith-autofusex, got {name}')
           if '+' in version:
               sys.exit(f'local version label is rejected by PyPI: {version}')
           if not re.fullmatch(r'\d+\.\d+\.\d+(\.(post|rc|b|a)\d+)?', version):
@@ -100,11 +100,11 @@ jobs:
           import nnsmith
           from pathlib import Path
 
-          version = md.version('autofusex-nnsmith')
+          version = md.version('nnsmith-autofusex')
           assert nnsmith.__version__ == version, (nnsmith.__version__, version)
           assert Path(nnsmith.__file__).resolve().parent.name == 'nnsmith'
           import nnsmith.graph_gen, nnsmith.abstract, nnsmith.error  # noqa: F401
-          print(f'autofusex-nnsmith {version}: import and metadata OK')
+          print(f'nnsmith-autofusex {version}: import and metadata OK')
           PY
 
       - name: Report source hash for autofusex pinning

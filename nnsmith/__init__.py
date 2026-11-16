@@ -4,7 +4,7 @@ except ImportError:
     from importlib.metadata import PackageNotFoundError, version
 
     try:
-        # The PyPI distribution is "autofusex-nnsmith"; the import name stays "nnsmith".
-        __version__ = version("autofusex-nnsmith")
+        # The PyPI distribution is "nnsmith-autofusex"; the import name stays "nnsmith".
+        __version__ = version("nnsmith-autofusex")
     except PackageNotFoundError:
         __version__ = "local-dev"
